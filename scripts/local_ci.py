@@ -15,7 +15,7 @@ from typing import Callable
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "pico_vllm" / "tests"))
 
-from ci_utils import TestEnvironment, detect_environment
+from ci_utils import TestEnvironment, detect_environment, module_available
 
 
 Requirement = Callable[[TestEnvironment], tuple[bool, str]]
@@ -38,6 +38,14 @@ def requires_cuda(env: TestEnvironment) -> tuple[bool, str]:
     if env.cuda_available:
         return True, ""
     return False, "CUDA is not available"
+
+
+def requires_cuda_flashinfer(env: TestEnvironment) -> tuple[bool, str]:
+    if not env.cuda_available:
+        return False, "CUDA is not available"
+    if not module_available("flashinfer"):
+        return False, "flashinfer is not installed"
+    return True, ""
 
 
 def requires_two_gpus(env: TestEnvironment) -> tuple[bool, str]:
@@ -99,6 +107,18 @@ def build_steps() -> list[Step]:
             requirement=requires_cuda,
         ),
         Step(
+            layer="01_ops",
+            name="FlashInfer metadata (CPU)",
+            command=pytest_cmd("pico_vllm/tests/ci/01_ops/test_flashinfer_metadata.py"),
+            requirement=always,
+        ),
+        Step(
+            layer="01_ops",
+            name="FlashInfer vs Triton paged attention",
+            command=pytest_cmd("pico_vllm/tests/ci/01_ops/test_flashinfer_attention.py"),
+            requirement=requires_cuda_flashinfer,
+        ),
+        Step(
             layer="02_single_card",
             name="CPU tiny random model inference",
             command=pytest_cmd("pico_vllm/tests/ci/02_single_card/test_torch_cpu_tiny_model.py"),
@@ -109,6 +129,18 @@ def build_steps() -> list[Step]:
             name="single CUDA card tiny model",
             command=pytest_cmd("pico_vllm/tests/ci/02_single_card/test_tiny_model_smoke.py"),
             requirement=requires_cuda,
+        ),
+        Step(
+            layer="02_single_card",
+            name="FlashInfer engine matches Triton engine",
+            command=pytest_cmd("pico_vllm/tests/ci/02_single_card/test_flashinfer_engine.py"),
+            requirement=requires_cuda_flashinfer,
+        ),
+        Step(
+            layer="02_single_card",
+            name="attention benchmark lifecycle (CPU)",
+            command=pytest_cmd("pico_vllm/tests/ci/02_single_card/test_attention_benchmark_lifecycle.py"),
+            requirement=always,
         ),
         Step(
             layer="02_single_card",

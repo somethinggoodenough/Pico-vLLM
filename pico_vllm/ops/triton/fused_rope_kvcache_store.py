@@ -45,6 +45,11 @@ def _fused_decode_rope_and_cache_kernel(
     if CHECK_CTX_LEN:
         ctx_len = tl.load(context_lens_ptr + tok_idx)
         if ctx_len == 0:
+            # Decode ghost rows need finite Q for FlashInfer's dummy KV page.
+            # Prefill disables CHECK_CTX_LEN: its lengths are per request.
+            ghost_offsets = tl.arange(0, head_dim)
+            ghost_q = q_rot_ptr + tok_idx * stride_q_rot_tok + q_head_idx * stride_q_rot_h
+            tl.store(ghost_q + ghost_offsets, 0.0)
             return
     
     # 计算一半维度的 offset，用于 RoPE 旋转

@@ -23,6 +23,13 @@ def get_ops_backend(device: torch.device | str, backend: str = "auto") -> OpsBac
 
         return TritonOps()
 
+    if backend == "flashinfer":
+        if device.type != "cuda":
+            raise ValueError("FlashInfer ops backend requires a CUDA device.")
+        from .flashinfer import FlashInferOps
+
+        return FlashInferOps()
+
     if backend in ("torch", "cpu"):
         if device.type != "cpu":
             raise ValueError("Torch ops backend currently supports CPU devices only.")

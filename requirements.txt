@@ -11,3 +11,8 @@ safetensors>=0.4
 pytest>=7.0
 numpy>=1.24
 matplotlib>=3.7
+
+# Optional: FlashInfer attention backend (ModelConfig(ops_backend="flashinfer")).
+# Alternative Linux/WSL torch 2.6 + CUDA 12.4 profile (separate venv;
+# use INSTEAD OF this file, not together with these torch/triton pins):
+# python -m pip install -r requirements-flashinfer.txt

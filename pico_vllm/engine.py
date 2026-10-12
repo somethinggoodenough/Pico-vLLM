@@ -30,6 +30,7 @@ class Engine:
                  manual_seed=42,
                  detokenize_outputs: bool = True,
                  ignore_eos: bool = False,
+                 max_num_seqs: int = 4,
                  ):
         device = torch.device(device)
         if device.type != "cuda":
@@ -90,7 +91,8 @@ class Engine:
             # self.transfer = None  # role="pd" 不需要传输层
             self.transfer = NoOpKVTransfer()  # 类型安全，poll() 和 try_recv 都是 no-op
 
-        self.scheduler = Scheduler(kv_cache_cls=cache_cls, kv_cache_kwargs=self.kv_cache_kwargs)
+        self.scheduler = Scheduler(kv_cache_cls=cache_cls, kv_cache_kwargs=self.kv_cache_kwargs,
+                                   max_num_seqs=max_num_seqs)
         self.no_more_requests = False # 不会再有更多请求进入
         self._done_sent = False # 已经全部发送完
 
@@ -109,12 +111,50 @@ class Engine:
         else:
             self.prefix_cache = None
 
+        # 需要 plan 的 attention 后端（如 FlashInfer）：每个 forward 前由 engine 显式 plan 一次，
+        # 28 层共享；Triton/Torch 后端 needs_attention_plan=False，这里全部跳过，行为不变。
+        self.attn_ops = model_ops if getattr(model_ops, "needs_attention_plan", False) else None
+        if self.attn_ops is not None:
+            self._setup_attention_backend()
+
         # CUDA Graph 只在有 decode 职责时 build
         if self.use_cuda_graph and role in ("d", "pd"):
             self._build_cuda_graph()
 
         self.model.eval()
         
+    def _setup_attention_backend(self):
+        """为需要 plan 的 attention 后端做一次性初始化。
+
+        - 绑定本 rank 的 attention 形状（TP 下用 local head 数）
+        - CUDA Graph 模式占用一个 dummy block：ghost 请求指向它，attention 只读它，
+          ghost 行的输出直接丢弃。FlashInfer 由 page 数推 kv_len，ghost 不能是 0 页，
+          所以需要一个合法 page。它不属于任何请求、不进 radix tree，不会被分配给别人或驱逐。
+          fused RoPE 对 context_lens=0 的行不写 KV；eager-only 不预留 dummy block。
+        """
+        from blockmanager import pagedblocktype
+
+        dummy_page = 0
+        self._attn_dummy_logical_block = None
+        if self.use_cuda_graph and self.role in ("d", "pd"):
+            dummy_logical = self.block_manager.allocate(1)[0]
+            block_type, dummy_page = self.block_manager.block_mapping[dummy_logical]
+            if block_type != pagedblocktype.GPU:
+                self.block_manager.dec_ref([dummy_logical])
+                raise RuntimeError("could not reserve a GPU block for attention padding")
+            self._attn_dummy_logical_block = dummy_logical
+
+        cfg = self.model.cfg
+        self.attn_ops.setup_attention(
+            num_qo_heads=cfg.local_num_attention_heads,
+            num_kv_heads=cfg.local_num_key_value_heads,
+            head_dim=cfg.head_dim,
+            page_size=self.block_manager.block_size,
+            dtype=self.block_manager.dtype,
+            device=self.device,
+            dummy_page=dummy_page,
+        )
+
     def _build_cuda_graph(self):
         """预分配静态 buffer 并 capture graph，只做一次"""
         if self.device.type != "cuda":
@@ -122,13 +162,30 @@ class Engine:
 
         # 静态 buffer
         self.static_input_ids    = torch.zeros(self.max_batch_size, 1, dtype=torch.long, device=self.device)
-        self.static_slot_mapping = torch.zeros(self.max_batch_size, dtype=torch.int32, device=self.device)
+        self.static_slot_mapping = torch.full((self.max_batch_size,), -1, dtype=torch.int32, device=self.device)
         self.static_position_ids = torch.zeros(self.max_batch_size, 1, dtype=torch.long, device=self.device)
         self.static_block_table  = torch.full(
             (self.max_batch_size, self.model.cfg.MAX_BLOCKS_PER_SEQ), -1,
             dtype=torch.int32, device=self.device
         )
         self.static_context_lens = torch.zeros(self.max_batch_size, dtype=torch.int32, device=self.device)
+
+        if self.attn_ops is not None:
+            # graph 模式下 attention 元数据住在固定地址的 buffer 里：每次 replay 前在 graph
+            # 外 plan（写这些 buffer），graph 只 capture kernel launch。
+            # indices buffer 上界：每个请求最多 cdiv(max_seq_len, block_size) 页
+            #（prefix 共享的页会在多个请求里重复出现，所以不能用总 block 数做上界）。
+            max_pages_per_seq = -(-self.kv_cache_kwargs["max_seq_len"] // self.block_manager.block_size)
+            self.attn_ops.init_cuda_graph(
+                max_batch_size=self.max_batch_size,
+                max_num_pages=self.max_batch_size * max_pages_per_seq,
+            )
+            # warmup / capture 用全 ghost 的 batch（与静态 buffer 的初始状态一致）
+            self.attn_ops.plan_decode(
+                [], [], use_cuda_graph=True,
+                block_table=self.static_block_table,
+                context_lens=self.static_context_lens,
+            )
 
         # 预热（触发后端 autotune/编译）
         for _ in range(3):
@@ -203,6 +260,18 @@ class Engine:
             bt = c.get_block_table()
             self.static_block_table[i, :bt.shape[0]].copy_(bt, non_blocking=True)
 
+        # 3.5 需要 plan 的 attention 后端：在 graph 外 plan，写进 capture 时绑定的固定 buffer。
+        # 页表直接用各请求 GPU 上的 block table 视图（不经过 CPU），长度用 CPU 侧已知值，无同步。
+        # context_lens_cpu[:B] 已经包含本步要写入的新 token（+1）；ghost 由后端补齐到 max_batch_size。
+        if self.attn_ops is not None:
+            self.attn_ops.plan_decode(
+                [c.get_block_table() for c in kv_caches],
+                context_lens_cpu[:B],
+                use_cuda_graph=True,
+                block_table=self.static_block_table,
+                context_lens=self.static_context_lens,
+            )
+
         # =================================================================
         # 4. CUDA Graph重放
         # =================================================================
@@ -237,10 +306,17 @@ class Engine:
             bt = c.get_block_table()
             block_table[i, :len(bt)] = bt
 
-        context_lens = torch.tensor(
-            [c.seq_len + 1 for c in kv_caches],
-            dtype=torch.int32, device=self.device
-        )
+        seq_lens = [c.seq_len + 1 for c in kv_caches]
+        context_lens = torch.tensor(seq_lens, dtype=torch.int32, device=self.device)
+
+        if self.attn_ops is not None:
+            self.attn_ops.plan_decode(
+                [c.get_block_table() for c in kv_caches],
+                seq_lens,
+                use_cuda_graph=False,
+                block_table=block_table,
+                context_lens=context_lens,
+            )
 
         with torch.no_grad():
             logits = self.model(
@@ -303,6 +379,11 @@ class Engine:
             
             self.scheduler.add_request(request)
             return request.request_id
+
+    def submit_ids(self, input_ids: list[int], max_new_tokens: int,
+                   temperature: float, top_p: float) -> int:
+        """Compatibility alias for the upstream pre-tokenized submission API."""
+        return self.submit_token_ids(input_ids, max_new_tokens, temperature, top_p)
 
     def _completed_text(self, request: Request) -> str:
         if not self.detokenize_outputs:
@@ -374,6 +455,17 @@ class Engine:
             context_lens = torch.tensor([total_len], dtype=torch.int32, device=self.device)
             new_token_lens = torch.tensor([new_len], dtype=torch.int32, device=self.device)
             q_start_loc = torch.tensor([0], dtype=torch.int32, device=self.device)
+
+            if self.attn_ops is not None:
+                # Q = 本次新算的 new_len 个 token，KV = prefix(命中) + 新 token；
+                # 后端用 bottom-right causal，对齐方式与 Triton prefill kernel 相同。
+                self.attn_ops.plan_prefill(
+                    [bt], [total_len], [new_len],
+                    block_table=block_table,
+                    context_lens=context_lens,
+                    new_token_lens=new_token_lens,
+                    q_start_loc=q_start_loc,
+                )
 
             # t_gpu = time.perf_counter()
             with torch.no_grad():

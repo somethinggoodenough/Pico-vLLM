@@ -46,6 +46,7 @@ def test_tiny_model_prefill_and_decode_on_single_cuda_card():
     context_lens = torch.tensor([seq_len], dtype=torch.int32, device=device)
     new_token_lens = torch.tensor([seq_len], dtype=torch.int32, device=device)
     q_start_loc = torch.tensor([0], dtype=torch.int32, device=device)
+    bm.gpu_kv_cache.fill_(float("nan"))
 
     with torch.no_grad():
         logits = model(
@@ -61,6 +62,9 @@ def test_tiny_model_prefill_and_decode_on_single_cuda_card():
             q_start_loc=q_start_loc,
         )
 
+        # Last-token logits must not mean last-token-only KV population.
+        assert torch.isfinite(bm.gpu_kv_cache[:, :, 0, :, :seq_len, :]).all()
+        assert torch.isnan(bm.gpu_kv_cache[:, :, 0, :, seq_len, :]).all()
         decode_ids = logits[:, -1, :].argmax(dim=-1, keepdim=True)
         decode_logits = model(
             decode_ids,
@@ -73,7 +77,9 @@ def test_tiny_model_prefill_and_decode_on_single_cuda_card():
             context_lens=torch.tensor([seq_len + 1], dtype=torch.int32, device=device),
         )
 
-    assert logits.shape == (1, seq_len, cfg.vocab_size)
+    # Upstream projects only the last token after all transformer layers.
+    assert logits.shape == (1, 1, cfg.vocab_size)
     assert decode_logits.shape == (1, 1, cfg.vocab_size)
     assert torch.isfinite(logits).all()
     assert torch.isfinite(decode_logits).all()
+    assert torch.isfinite(bm.gpu_kv_cache[:, :, 0, :, :seq_len + 1, :]).all()

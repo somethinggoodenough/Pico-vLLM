@@ -1,4 +1,8 @@
-import sys, os; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+import sys
+from pathlib import Path
+
+# tests/ci/01_ops is one level deeper than the original test directory.
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 # test_prefill_paged_attention.py
 import pytest
 import torch
@@ -281,7 +285,8 @@ if __name__ == "__main__":
     results = []
     for t in tests:
         try:
-            passed = t()
+            t()
+            passed = True
             results.append((t.__name__, passed))
         except Exception as e:
             print(f"  ❌ {t.__name__} 抛出异常: {e}")
@@ -298,3 +303,4 @@ if __name__ == "__main__":
         print("\n🎉 全部测试通过！")
     else:
         print(f"\n⚠️  {sum(1 for _, p in results if not p)} 个测试失败")
+    raise SystemExit(0 if all_pass else 1)

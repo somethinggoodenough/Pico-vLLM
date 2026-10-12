@@ -39,6 +39,7 @@ def test_tiny_random_model_prefill_and_forward_decode_on_cpu():
     seq_len = input_ids.shape[1]
     block_table = torch.full((1, 4), -1, dtype=torch.int32, device=device)
     block_table[0, 0] = 0
+    bm.gpu_kv_cache.fill_(float("nan"))
 
     with torch.no_grad():
         logits = model(
@@ -54,6 +55,8 @@ def test_tiny_random_model_prefill_and_forward_decode_on_cpu():
             q_start_loc=torch.tensor([0], dtype=torch.int32, device=device),
         )
 
+        assert torch.isfinite(bm.gpu_kv_cache[:, :, 0, :, :seq_len, :]).all()
+        assert torch.isnan(bm.gpu_kv_cache[:, :, 0, :, seq_len, :]).all()
         decode_ids = logits[:, -1, :].argmax(dim=-1, keepdim=True)
         decode_logits = model.forward_decode(
             decode_ids,
@@ -66,7 +69,9 @@ def test_tiny_random_model_prefill_and_forward_decode_on_cpu():
         )
 
     assert model.ops.device_type == "cpu"
-    assert logits.shape == (1, seq_len, cfg.vocab_size)
+    # Upstream returns only the last token's logits, on CPU as well as CUDA.
+    assert logits.shape == (1, 1, cfg.vocab_size)
     assert decode_logits.shape == (1, 1, cfg.vocab_size)
     assert torch.isfinite(logits).all()
     assert torch.isfinite(decode_logits).all()
+    assert torch.isfinite(bm.gpu_kv_cache[:, :, 0, :, :seq_len + 1, :]).all()
